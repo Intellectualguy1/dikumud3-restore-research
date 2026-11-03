@@ -13,6 +13,7 @@ fresh copy of that state:
 Everything observed is written to OUT (default research-out/) and to the GitHub step
 summary. Usage: restore_cases.py [all|setup|case1|case2|selftest]
 """
+import itertools
 import os
 import re
 import select
@@ -37,7 +38,8 @@ PASSWORDS = {"Papi": "Papi1234", "Alice": "Alice123", "Bob": "Bob12345"}
 ZONE_GOOD, ZONE_BAD = "holiday20", "holiday2020"
 BOX = "xmas_box@holiday20"      # the 2020 Christmas Gift box (a container)
 BUN = "honeybun@udgaard"        # ordinary item Alice stores in the box
-AXE = "axe0@udgaard"            # ordinary item Bob earns after the backup
+SPATULA = "moot_epsp@udgaard"   # ordinary item Bob earns after the backup (new fighters start with an axe)
+MARKERS = itertools.count(1)
 
 os.makedirs(OUT, exist_ok=True)
 _SUMMARY = open(os.path.join(OUT, "summary.md"), "a", encoding="utf-8")
@@ -193,8 +195,8 @@ class Conn:
 
     def cmd(self, line, timeout=60.0):
         """Send a command, then a marker `say`; return everything the command printed."""
-        self.n += 1
-        mk = f"ZQ{self.n}QZ"
+        # one counter for all connections: everybody in the room hears everybody's `say`
+        mk = f"ZQ{next(MARKERS)}QZ"
         self.send(line)
         self.send(f"say {mk}")
         chunk = self.wait(re.escape(mk) + r"[^\n]*\n?", timeout)
@@ -419,7 +421,7 @@ def tokens(path, words):
 
 def evidence(title, backup_dir):
     rows = []
-    words = ["xmas_box", "holiday20", "slime", "basis", "honeybun", "udgaard", "axe0"]
+    words = ["xmas_box", "holiday20", "slime", "basis", "honeybun", "udgaard", "moot_epsp"]
     for who in ("alice", "bob"):
         for suffix in ("", ".inv"):
             live = ply(who, suffix)
@@ -469,6 +471,16 @@ def restore_snapshot():
 
 # --------------------------------------------------------------------------- scenario
 
+def look_in_box(c):
+    """Look inside the Christmas Gift box; try the usual spellings of the command."""
+    out = ""
+    for look in ("look in gift", "look into gift", "examine gift"):
+        out = c.cmd(look)
+        if "honey bun" in out.lower() or "empty" in out.lower():
+            break
+    return out
+
+
 def need(text, word, what):
     """Stop early, with the real output, if a setup step did not do what the scenario needs."""
     if word.lower() not in (text or "").lower():
@@ -481,7 +493,7 @@ def inv_flags(text):
         "slime": "slimy remains" in low,
         "box": any("christmas" in ln and "gift" in ln and "slimy" not in ln for ln in low.splitlines()),
         "bun": "honey bun" in low,
-        "axe": re.search(r"\baxe\b", low) is not None,
+        "spatula": "spatula" in low,
     }
 
 
@@ -506,9 +518,13 @@ def setup():
     block("T0 Alice: open gift", alice.cmd("open gift"))
     block("T0 Papi: load bun", papi.cmd(f"load {BUN}"))
     block("T0 Papi: give bun alice", papi.cmd("give bun alice"))
-    block("T0 Alice: put bun in gift", alice.cmd("put bun in gift"))
-    out = alice.cmd("look in gift")
-    block("T0 Alice: look in gift", out)
+    out = ""
+    for put in ("put bun in gift", "put bun gift"):
+        block(f"T0 Alice: {put}", alice.cmd(put))
+        out = look_in_box(alice)
+        block("T0 Alice: look in gift", out)
+        if "honey bun" in out.lower():
+            break
     need(out, "honey bun", "the bun is not inside the box")
     block("T0 Alice: close gift", alice.cmd("close gift"))
     t0_inv = alice.cmd("inventory")
@@ -541,12 +557,17 @@ def setup():
 
     # T2: Bob earns something that exists only on the live server
     bob = login("Bob", "t2")
-    block("T2 Papi: goto bob", papi.cmd("goto bob"))
-    block("T2 Papi: load axe", papi.cmd(f"load {AXE}"))
-    block("T2 Papi: give axe bob", papi.cmd("give axe bob"))
+    block("T2 Papi: where is everyone (look)", papi.cmd("look"))
+    block("T2 Papi: load spatula", papi.cmd(f"load {SPATULA}"))
+    block("T2 Papi: give spatula bob", papi.cmd("give spatula bob"))
     t2_inv = bob.cmd("inventory")
     block("T2 Bob inventory (new item)", t2_inv)
-    need(t2_inv, "axe", "Bob did not receive the axe")
+    if "spatula" not in t2_inv.lower():
+        block("T2 Papi: goto bob (fallback)", papi.cmd("goto bob"))
+        block("T2 Papi: give spatula bob (again)", papi.cmd("give spatula bob"))
+        t2_inv = bob.cmd("inventory")
+        block("T2 Bob inventory (second try)", t2_inv)
+    need(t2_inv, "spatula", "Bob did not receive the spatula")
     RESULTS["t2_bob"] = inv_flags(t2_inv)
     leave(bob)
     srv.stop(papi)
@@ -614,7 +635,7 @@ def case2():
     alice, inv = alice_view("c2a", "Case 2, first boot")
     RESULTS["c2a_alice"] = inv_flags(inv)
     block("Case 2: Alice open gift", alice.cmd("open gift"))
-    look_in = alice.cmd("look in gift")
+    look_in = look_in_box(alice)
     block("Case 2: Alice look in gift", look_in)
     got = alice.cmd("get bun from gift")
     if "honey bun" not in got.lower() and "you get" not in got.lower():
@@ -637,7 +658,7 @@ def case2():
     papi = login("Papi", "c2b")
     alice, inv = alice_view("c2b", "Case 2, after a clean restart")
     RESULTS["c2b_alice"] = inv_flags(inv)
-    block("Case 2, after restart: Alice look in gift", alice.cmd("look in gift"))
+    block("Case 2, after restart: Alice look in gift", look_in_box(alice))
     leave(alice)
     bob = login("Bob", "c2b")
     binv = bob.cmd("inventory")
@@ -656,7 +677,7 @@ def verdict():
         "|---|---|",
         f"| T0: Alice held the box with the bun inside | {r.get('t0_alice')} |",
         f"| T1: Alice after logging in with the wrong zone name | {r.get('t1_alice')} |",
-        f"| T2: Bob holds the new axe | {r.get('t2_bob')} |",
+        f"| T2: Bob holds the new spatula | {r.get('t2_bob')} |",
         f"| Case 1 first boot: Alice | {r.get('c1a_alice')} |",
         f"| Case 1 after restart: Alice | {r.get('c1b_alice')} |",
         f"| Case 1 after restart: Bob | {r.get('c1b_bob')} |",
