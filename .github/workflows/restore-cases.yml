@@ -1,0 +1,99 @@
+name: Restore cases (research)
+
+# Research only. This workflow lives on a branch of a fork of Seifert69/DikuMUD3. It builds the
+# pinned upstream commit with the same steps as the upstream CMake workflow, then runs two
+# recovery cases against a disposable server on the runner. It changes no game file.
+
+on:
+  push:
+    branches: [ "research/restore-cases" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUILD_TYPE: Release
+  PINNED_SHA: de26ada15b60df1e6f49d712152946745a07fdfc
+  BUILD_KEY: v1
+
+jobs:
+  cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Confirm the game code is the pinned upstream commit
+      run: |
+        set -e
+        echo "HEAD:   $(git rev-parse HEAD)"
+        echo "pinned: $PINNED_SHA"
+        git merge-base --is-ancestor "$PINNED_SHA" HEAD
+        changed=$(git diff --name-only "$PINNED_SHA" HEAD)
+        echo "Files that differ from the pinned commit:"
+        echo "$changed"
+        bad=$(echo "$changed" | grep -v -E '^(\.github/workflows/restore-cases\.yml|research/)' || true)
+        if [ -n "$bad" ]; then
+          echo "::error::Game files differ from the pinned commit:"
+          echo "$bad"
+          exit 1
+        fi
+        echo "Only research files differ from $PINNED_SHA."
+
+    - name: Runner
+      run: |
+        nproc; free -m | head -2; cmake --version | head -1; g++ --version | head -1; python3 --version
+
+    # The next steps are the ones in the upstream .github/workflows/cmake.yml.
+    - name: boost
+      run: sudo apt-get update && sudo apt-get install -yq libboost-all-dev libfl-dev libssl-dev rapidjson-dev
+
+    - name: Restore build cache
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          build
+          vme
+        key: dm3-built-${{ env.BUILD_KEY }}-${{ env.PINNED_SHA }}
+
+    - name: Configure CMake
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
+
+    - name: Build
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        start=$(date +%s)
+        cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel 4
+        echo "build seconds: $(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+
+    - name: Save build cache
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          build
+          vme
+        key: dm3-built-${{ env.BUILD_KEY }}-${{ env.PINNED_SHA }}
+
+    - name: Show what the build produced
+      run: ls -l vme/bin | head -30
+
+    - name: Run the damaged state and the two recovery cases
+      env:
+        DM3_ROOT: ${{ github.workspace }}
+        OUT: ${{ github.workspace }}/research-out
+      run: python3 research/restore_cases.py all
+
+    - name: Keep everything the run produced
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: research-out
+        path: research-out
+        retention-days: 14
