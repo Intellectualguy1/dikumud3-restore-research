@@ -15,7 +15,7 @@ permissions:
 env:
   BUILD_TYPE: Release
   PINNED_SHA: de26ada15b60df1e6f49d712152946745a07fdfc
-  BUILD_KEY: v1
+  BUILD_KEY: v2
 
 jobs:
   cases:
