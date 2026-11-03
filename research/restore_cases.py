@@ -5,10 +5,12 @@ It drives a locally running DikuMUD3 (vme + mplex) over telnet and never edits a
 source file. It builds one damaged game state, then runs two recovery cases, each from a
 fresh copy of that state:
 
-  setup   healthy server -> backup -> wrong zone name -> Alice logs in and saves the
-          slimed box -> Bob earns a new item -> clean shutdown -> snapshot
+  setup   healthy server (new characters type `save`: `quit` drops a guest unsaved) -> backup
+          -> wrong zone name -> Alice logs in and saves the slimed box -> Bob earns a new item
+          -> clean shutdown -> snapshot
   case1   put the zone name back and restart; restore no player file
-  case2   put the zone name back; restore only Alice's inventory file from the backup
+  case2   put the zone name back; restore only Alice's inventory file from the backup;
+          Alice opens the box and takes the item out; check again after a clean restart
 
 Everything observed is written to OUT (default research-out/) and to the GitHub step
 summary. Usage: restore_cases.py [all|setup|case1|case2|selftest]
@@ -45,6 +47,7 @@ os.makedirs(OUT, exist_ok=True)
 _SUMMARY = open(os.path.join(OUT, "summary.md"), "a", encoding="utf-8")
 _GH = os.environ.get("GITHUB_STEP_SUMMARY")
 RESULTS = {}
+MISSING = {}    # boot tag -> number of "Could not open data file" lines in that boot's vme.log
 
 
 def say(msg):
@@ -353,6 +356,7 @@ class Server:
         else:
             raise Timeout(f"vme did not reach the game loop:\n{read_log()[-3000:]}")
         self.boot_seconds = round(time.time() - t0, 1)
+        MISSING[self.tag] = sum(1 for ln in read_log().splitlines() if "Could not open data file" in ln)
         self.mout = open(os.path.join(OUT, f"mplex-{self.tag}.txt"), "w")
         self.mp = subprocess.Popen(["./mplex", "-p", str(PORT)], cwd=BIN, stdout=self.mout, stderr=subprocess.STDOUT)
         probe_end = time.time() + 120
@@ -459,6 +463,14 @@ def log_lines(*needles):
     return "\n".join(ln for ln in read_log().splitlines() if any(n in ln for n in needles))
 
 
+def zone_lines(tag, *names):
+    """The vme.log lines about the holiday zones, and how this boot compares with the T0 boot.
+    This checkout lacks the data file of many zones listed in etc/zonelist; every boot says so."""
+    mine = log_lines(*[f"Indexing {n} " for n in names], *[f"zone/{n}.data" for n in names])
+    return (f"{mine}\n"
+            f"'Could not open data file' lines in this boot: {MISSING.get(tag)}; in the T0 boot: {MISSING.get('t0')}")
+
+
 SNAP = os.path.join(OUT, "snap")
 BACKUP = os.path.join(OUT, "backup-ply")
 
@@ -476,6 +488,14 @@ def restore_snapshot():
     shutil.rmtree(LIB)
     shutil.copytree(os.path.join(SNAP, "lib"), LIB)
     shutil.copy2(os.path.join(SNAP, "zonelist"), ZONELIST)
+
+
+def starting_files(title):
+    """Digest of the four player files and the holiday line of etc/zonelist: the proof that a case starts from the snapshot."""
+    rows = [f"{w}{s}: {digest(ply(w, s))}" for w in ("alice", "bob") for s in ("", ".inv")]
+    rows.append("etc/zonelist: " + " | ".join(ln.strip() for ln in zonelist_text().splitlines()
+                                              if ln.startswith(("holiday20", "holiday2020"))))
+    block(title, "\n".join(rows))
 
 
 # --------------------------------------------------------------------------- scenario
@@ -504,6 +524,29 @@ def inv_flags(text):
         "bun": "honey bun" in low,
         "spatula": "spatula" in low,
     }
+
+
+def show(flags):
+    """Plain words for what an inventory listing contained (a closed box does not list its contents)."""
+    if flags is None:
+        return "not run"
+    names = {"box": "the original Christmas Gift", "slime": "the slimy remains of a Christmas Gift",
+             "bun": "a honey bun in the pack", "spatula": "a spatula"}
+    return ", ".join(v for k, v in names.items() if flags.get(k)) or "none of the four"
+
+
+def box_check(c, label):
+    """Open the Christmas Gift, look inside, take the honey bun out; return (inventory flags, bun was listed)."""
+    block(f"{label}: Alice open gift", c.cmd("open gift"))
+    look_in = look_in_box(c)
+    block(f"{label}: Alice look in gift", look_in)
+    got = c.cmd("get bun from gift")
+    if "honey bun" not in got.lower() and "you get" not in got.lower():
+        got += "\n--- retry without 'from' ---\n" + c.cmd("get bun gift")
+    block(f"{label}: Alice get bun from gift", got)
+    inv = c.cmd("inventory")
+    block(f"{label}: Alice inventory after taking the item out", inv)
+    return inv_flags(inv), "honey bun" in look_in.lower()
 
 
 def setup():
@@ -560,7 +603,7 @@ def setup():
     # T1: the incident (zone name wrong, Alice logs in and saves)
     set_zone_name(ZONE_GOOD, ZONE_BAD)
     srv = Server("t1").start()
-    block("T1 vme.log: zone problems", log_lines("Could not open data file", ZONE_BAD, "holiday"))
+    block("T1 vme.log: the renamed zone", zone_lines("t1", ZONE_GOOD, ZONE_BAD))
     papi = login("Papi", "t1")
     alice = login("Alice", "t1")
     t1_inv = alice.cmd("inventory")
@@ -568,9 +611,11 @@ def setup():
     RESULTS["t1_alice"] = inv_flags(t1_inv)
     block("T1 Alice: look slime", alice.cmd("look slime"))
     block("T1 Alice: open slime", alice.cmd("open slime"))
-    block("T1 Alice: look in slime", alice.cmd("look in slime"))
+    look_in = alice.cmd("look in slime")
+    block("T1 Alice: look in slime", look_in)
+    RESULTS["t1_slime_holds_bun"] = "honey bun" in look_in.lower()
     saved = leave(alice)
-    block("T1 vme.log: sliming lines", log_lines("Sliming"))
+    block("T1 vme.log: Alice's login, the sliming and her save", log_lines("Alice[", "Sliming", "Saving PC Alice"))
     say(f"Alice connection dropped by the server: {saved}")
 
     # T2: Bob earns something that exists only on the live server
@@ -591,7 +636,8 @@ def setup():
     srv.stop(papi)
     evidence("Live state at T2 versus the T0 backup (server stopped cleanly)", BACKUP)
     snapshot()
-    summary("\nSnapshot of `vme/lib` and `vme/etc/zonelist` saved; each case below starts from a fresh copy of it.")
+    starting_files("Snapshot of vme/lib and etc/zonelist taken after the T2 shutdown")
+    summary("\nEach case below starts from a fresh copy of that snapshot.")
 
 
 def alice_view(phase, label):
@@ -605,16 +651,19 @@ def alice_view(phase, label):
 def case1():
     summary("\n## Case 1: put the zone name back, restart, restore no player file")
     restore_snapshot()
+    starting_files("Case 1 start: files copied back from the snapshot")
     set_zone_name(ZONE_BAD, ZONE_GOOD)
     srv = Server("c1a").start()
-    block("Case 1 vme.log (boot with the zone back)", log_lines("Could not open data file", "holiday"))
+    block("Case 1 vme.log (boot with the zone name back)", zone_lines("c1a", ZONE_GOOD, ZONE_BAD))
     papi = login("Papi", "c1a")
     alice, inv = alice_view("c1a", "Case 1, first boot")
     RESULTS["c1a_alice"] = inv_flags(inv)
     block("Case 1: Alice look slime", alice.cmd("look slime"))
     block("Case 1: Alice look gift", alice.cmd("look gift"))
     block("Case 1: Alice open slime", alice.cmd("open slime"))
-    block("Case 1: Alice look in slime", alice.cmd("look in slime"))
+    look_in = alice.cmd("look in slime")
+    block("Case 1: Alice look in slime", look_in)
+    RESULTS["c1a_slime_holds_bun"] = "honey bun" in look_in.lower()
     leave(alice)
     bob = login("Bob", "c1a")
     binv = bob.cmd("inventory")
@@ -628,6 +677,9 @@ def case1():
     papi = login("Papi", "c1b")
     alice, inv = alice_view("c1b", "Case 1, after a clean restart")
     RESULTS["c1b_alice"] = inv_flags(inv)
+    look_in = alice.cmd("look in slime")
+    block("Case 1, after a clean restart: Alice look in slime", look_in)
+    RESULTS["c1b_slime_holds_bun"] = "honey bun" in look_in.lower()
     leave(alice)
     bob = login("Bob", "c1b")
     binv = bob.cmd("inventory")
@@ -636,11 +688,13 @@ def case1():
     leave(bob)
     block("Case 1 vme.log: Sliming lines, second boot", log_lines("Sliming") or "(none)")
     srv.stop(papi)
+    evidence("Case 1 final files versus the T0 backup", BACKUP)
 
 
 def case2():
     summary("\n## Case 2: put the zone name back and restore only Alice's inventory file")
     restore_snapshot()
+    starting_files("Case 2 start: files copied back from the snapshot")
     set_zone_name(ZONE_BAD, ZONE_GOOD)
     src = os.path.join(BACKUP, "a", "alice.inv")
     shutil.copy2(src, ply("alice", ".inv"))
@@ -649,63 +703,67 @@ def case2():
           f"alice.inv bkup  {digest(src)}\nbob.inv live    {digest(ply('bob', '.inv'))}")
 
     srv = Server("c2a").start()
+    block("Case 2 vme.log (boot with the zone name back)", zone_lines("c2a", ZONE_GOOD, ZONE_BAD))
     papi = login("Papi", "c2a")
     alice, inv = alice_view("c2a", "Case 2, first boot")
     RESULTS["c2a_alice"] = inv_flags(inv)
-    block("Case 2: Alice open gift", alice.cmd("open gift"))
-    look_in = look_in_box(alice)
-    block("Case 2: Alice look in gift", look_in)
-    got = alice.cmd("get bun from gift")
-    if "honey bun" not in got.lower() and "you get" not in got.lower():
-        got += "\n--- retry without 'from' ---\n" + alice.cmd("get bun gift")
-    block("Case 2: Alice get bun from gift", got)
-    inv2 = alice.cmd("inventory")
-    block("Case 2: Alice inventory after taking the item out", inv2)
-    RESULTS["c2a_alice_after"] = inv_flags(inv2)
-    RESULTS["c2a_look_in_has_bun"] = "honey bun" in look_in.lower()
+    RESULTS["c2a_alice_after"], RESULTS["c2a_look_in_has_bun"] = box_check(alice, "Case 2, first boot")
+    # put the bun back and close the box, so the check can be repeated after the restart
+    block("Case 2, first boot: Alice put bun in gift", alice.cmd("put bun in gift"))
+    again = look_in_box(alice)
+    block("Case 2, first boot: Alice look in gift (bun put back)", again)
+    RESULTS["c2a_bun_back_in_box"] = "honey bun" in again.lower()
+    block("Case 2, first boot: Alice close gift", alice.cmd("close gift"))
     leave(alice)
     bob = login("Bob", "c2a")
     binv = bob.cmd("inventory")
     block("Case 2, first boot: Bob inventory", binv)
     RESULTS["c2a_bob"] = inv_flags(binv)
     leave(bob)
-    block("Case 2 vme.log: Sliming lines, first boot", log_lines("Sliming"))
+    block("Case 2 vme.log: Sliming lines, first boot", log_lines("Sliming") or "(none)")
     srv.stop(papi)
 
     srv = Server("c2b").start()
     papi = login("Papi", "c2b")
     alice, inv = alice_view("c2b", "Case 2, after a clean restart")
     RESULTS["c2b_alice"] = inv_flags(inv)
-    block("Case 2, after restart: Alice look in gift", look_in_box(alice))
+    RESULTS["c2b_alice_after"], RESULTS["c2b_look_in_has_bun"] = box_check(alice, "Case 2, after a clean restart")
     leave(alice)
     bob = login("Bob", "c2b")
     binv = bob.cmd("inventory")
     block("Case 2, after a clean restart: Bob inventory", binv)
     RESULTS["c2b_bob"] = inv_flags(binv)
     leave(bob)
-    block("Case 2 vme.log: Sliming lines, second boot", log_lines("Sliming"))
+    block("Case 2 vme.log: Sliming lines, second boot", log_lines("Sliming") or "(none)")
     srv.stop(papi)
     evidence("Case 2 final files versus the T0 backup", BACKUP)
 
 
 def verdict():
     r = RESULTS
-    lines = [
-        "| Check | Result |",
-        "|---|---|",
-        f"| T0: Alice held the box with the bun inside | {r.get('t0_alice')} |",
-        f"| T1: Alice after logging in with the wrong zone name | {r.get('t1_alice')} |",
-        f"| T2: Bob holds the new spatula | {r.get('t2_bob')} |",
-        f"| Case 1 first boot: Alice | {r.get('c1a_alice')} |",
-        f"| Case 1 after restart: Alice | {r.get('c1b_alice')} |",
-        f"| Case 1 after restart: Bob | {r.get('c1b_bob')} |",
-        f"| Case 2 first boot: Alice | {r.get('c2a_alice')} |",
-        f"| Case 2: bun still listed in the box before taking it | {r.get('c2a_look_in_has_bun')} |",
-        f"| Case 2: Alice after taking the bun out | {r.get('c2a_alice_after')} |",
-        f"| Case 2 after restart: Alice | {r.get('c2b_alice')} |",
-        f"| Case 2 after restart: Bob | {r.get('c2b_bob')} |",
+    rows = [
+        ("T0, before the backup: Alice's pack", show(r.get("t0_alice"))),
+        ("T1, zone name wrong, Alice logs in: her pack", show(r.get("t1_alice"))),
+        ("T1: honey bun listed inside the slime (`look in slime`)", r.get("t1_slime_holds_bun")),
+        ("T2: Bob's pack", show(r.get("t2_bob"))),
+        ("Case 1, first boot: Alice's pack", show(r.get("c1a_alice"))),
+        ("Case 1, first boot: honey bun listed inside the slime", r.get("c1a_slime_holds_bun")),
+        ("Case 1, after a clean restart: Alice's pack", show(r.get("c1b_alice"))),
+        ("Case 1, after a clean restart: honey bun listed inside the slime", r.get("c1b_slime_holds_bun")),
+        ("Case 1, after a clean restart: Bob's pack", show(r.get("c1b_bob"))),
+        ("Case 2, first boot: Alice's pack", show(r.get("c2a_alice"))),
+        ("Case 2, first boot: honey bun listed in the box before taking it out", r.get("c2a_look_in_has_bun")),
+        ("Case 2, first boot: Alice's pack after taking it out", show(r.get("c2a_alice_after"))),
+        ("Case 2, first boot: bun back in the box before she quit", r.get("c2a_bun_back_in_box")),
+        ("Case 2, first boot: Bob's pack", show(r.get("c2a_bob"))),
+        ("Case 2, after a clean restart: Alice's pack", show(r.get("c2b_alice"))),
+        ("Case 2, after a clean restart: honey bun listed in the box before taking it out", r.get("c2b_look_in_has_bun")),
+        ("Case 2, after a clean restart: Alice's pack after taking it out", show(r.get("c2b_alice_after"))),
+        ("Case 2, after a clean restart: Bob's pack", show(r.get("c2b_bob"))),
     ]
-    summary("\n## Flags read from the game text (see the transcripts for the real output)\n\n" + "\n".join(lines))
+    lines = ["| Check | Read from the game text |", "|---|---|"] + [f"| {a} | {b} |" for a, b in rows]
+    summary("\n## What the game showed (read from the text by the harness; the transcripts hold the real output)\n\n"
+            + "\n".join(lines))
 
 
 def main():
