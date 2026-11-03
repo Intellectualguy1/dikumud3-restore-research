@@ -307,6 +307,15 @@ def leave(c):
     return ok
 
 
+def save_guest(c, phase):
+    """A new character is a guest, and `quit` drops a guest without writing any file (run 2 of this
+    harness showed it: the vme.log said "(GUEST) has entered the game" and no Alice file existed
+    after the shutdown). `save` is what turns the guest into a saved player."""
+    out = c.cmd("save")
+    block(f"{phase} {c.name}: save", out)
+    return out
+
+
 # --------------------------------------------------------------------------- server
 
 def read_log():
@@ -531,9 +540,18 @@ def setup():
     block("T0 Alice inventory before quitting", t0_inv)
     RESULTS["t0_alice"] = inv_flags(t0_inv)
     block("T0 Bob inventory", bob.cmd("inventory"))
-    leave(alice)
-    leave(bob)
+    for c in (alice, bob, papi):
+        save_guest(c, "T0")
+    made = [ply("alice"), ply("alice", ".inv"), ply("bob"), ply("bob", ".inv"), ply("papi"), ply("papi", ".inv")]
+    block("T0 player files on disk after the saves",
+          "\n".join(f"{os.path.relpath(p, ROOT)}: {digest(p)}" for p in made))
+    missing = [os.path.relpath(p, ROOT) for p in made if not os.path.exists(p)]
+    if missing:
+        raise RuntimeError("setup step failed: the saves wrote no file for: " + ", ".join(missing))
+    say(f"Alice dropped by the server on quit: {leave(alice)}")
+    say(f"Bob dropped by the server on quit: {leave(bob)}")
     srv.stop(papi)
+    block("T0 vme.log: saves", log_lines("Saving PC", "Saving all players", "GUEST"))
     if os.path.exists(BACKUP):
         shutil.rmtree(BACKUP)
     shutil.copytree(PLY, BACKUP)
